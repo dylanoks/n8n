@@ -355,12 +355,14 @@ app.post("/render", async (req, res) => {
       .replace(/:/g, "\\:")
       .replace(/'/g, "'\\''");
 
+    // Resolve font: try system fonts via pickFont(), fall back to DejaVu Bold
+    const fontFile = pickFont() || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+
     // Build the -vf filter chain as a single string.
     // spawn() passes this as one argv element — no shell parsing.
-    // Font is hardcoded to DejaVu Sans Bold (installed in the Dockerfile).
     const drawtextFilter =
       `drawtext=` +
-      `fontfile='/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf':` +
+      `fontfile='${fontFile}':` +
       `text='${escapedPhrase}':` +
       `fontsize=80:` +
       `fontcolor=white:` +
