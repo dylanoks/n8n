@@ -1,27 +1,29 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// server.js — Instagram Reel Generator API (v4 — quiet FFmpeg, clean logs)
+// server.js — Instagram Reel Generator API (v6 — eliminate final re-encode)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// CHANGES FROM v3:
+// CHANGES FROM v5 (fix SIGKILL on final render — still OOM at 720×1280):
 //
-// 1. FFmpeg runs with -hide_banner -loglevel error so it only emits output
-//    when something actually goes wrong.  No more codec tables, encoding
-//    speed lines, or frame counters flooding Railway logs.
+// ROOT CAUSE: v5 encoded video TWICE.  Each clip was fully scaled and
+// encoded to H.264 during extraction (step 7), then the final render
+// (step 9) decoded ALL clips and re-encoded them again with libx264 just
+// to add audio.  That second libx264 instance processing 8 seconds of
+// 720×1280 video was what Railway killed.
 //
-// 2. runFFmpeg no longer streams stderr line-by-line to console during
-//    execution.  It buffers stderr silently, then:
-//      • On success → logs one line: "FFmpeg exited with code: 0 signal: null"
-//      • On failure → logs that same line PLUS the full stderr buffer.
-//    Because loglevel is "error", the buffer will only contain actual errors.
+// FIX: The final render now uses -c:v copy.  Since every clip is already
+// 720×1280 H.264 yuv420p at 30fps with identical parameters, the concat
+// produces a stream-copyable file.  The final step only muxes the existing
+// video stream with a newly encoded audio track — no video decoder or
+// encoder is instantiated, so peak memory drops from ~200 MB to ~20 MB.
 //
-// 3. After every FFmpeg call the route handler logs exactly:
-//      FFmpeg exited with code: <code> signal: <signal>
-//      Output exists: true/false
-//      Output size: <bytes>
-//    So you can ctrl-F these three lines in Railway to see the outcome.
+// OTHER CHANGES:
+//   - Clip count: 10 × 0.8s → 5 × 1.6s  (still 8s total, half the
+//     FFmpeg invocations, half the temp files)
+//   - Audio bitrate: 128k → 96k
+//   - Max concurrent jobs: 3 → 1 (Railway free tier has ~512 MB)
 //
-// 4. Drawtext is still disabled.  Pipeline: download → probe → extract →
-//    concat → scale + audio replace → serve.
+// Drawtext is still disabled.  Pipeline: download → probe → extract 5
+// clips → concat → mux audio (video copy) → serve.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -40,7 +42,7 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const OUTPUTS_DIR = path.join(__dirname, "outputs");
 const TEMP_ROOT = path.join(__dirname, "tmp");
 const MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024;
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS, 10) || 3;
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS, 10) || 1;
 let activeJobs = 0;
 
 fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
@@ -79,16 +81,19 @@ app.get("/health", (_req, res) => {
 
 app.post("/render", async (req, res) => {
   // ── 1. Parse & validate ──────────────────────────────────────────────────
+  //
+  // Defaults changed: 5 clips × 1.6s = 8s total.
+  // The request body can still override these if needed.
 
   const {
     sourceVideoUrl,
     audioUrl,
     phrase = "",
-    clipCount = 10,
-    clipDuration = 0.8,
+    clipCount = 5,
+    clipDuration = 1.6,
     finalDuration = 8,
-    width = 1080,
-    height = 1920,
+    width = 720,
+    height = 1280,
   } = req.body;
 
   if (!sourceVideoUrl || !audioUrl) {
@@ -133,6 +138,8 @@ app.post("/render", async (req, res) => {
   console.log(`[${jobId}]   sourceVideoUrl: ${sourceVideoUrl}`);
   console.log(`[${jobId}]   audioUrl: ${audioUrl}`);
   console.log(`[${jobId}]   phrase: "${phrase}"`);
+  console.log(`[${jobId}]   clips: ${clipCount} × ${clipDuration}s = ${clipCount * clipDuration}s`);
+  console.log(`[${jobId}]   resolution: ${width}×${height}`);
 
   try {
     // ── 3. Download source video ───────────────────────────────────────────
@@ -177,6 +184,10 @@ app.post("/render", async (req, res) => {
     }
 
     // ── 7. Extract clips ───────────────────────────────────────────────────
+    //
+    // Each clip is FULLY scaled and encoded here — 720×1280, H.264, yuv420p,
+    // 30fps, veryfast, CRF 28.  This means the concat output will be
+    // stream-copyable and the final step does NOT need to re-encode video.
 
     const scaleFilter =
       `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
@@ -207,8 +218,8 @@ app.post("/render", async (req, res) => {
         "-t", String(clipDuration),
         "-vf", scaleFilter,
         "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
+        "-preset", "veryfast",
+        "-crf", "28",
         "-an",
         "-r", "30",
         "-pix_fmt", "yuv420p",
@@ -242,6 +253,9 @@ app.post("/render", async (req, res) => {
     }
 
     // ── 8. Concatenate ─────────────────────────────────────────────────────
+    //
+    // All clips have identical codec params so concat demuxer + stream copy
+    // works reliably.  No re-encoding happens here.
 
     const concatListPath = path.join(jobDir, "concat_list.txt");
     fs.writeFileSync(
@@ -285,13 +299,28 @@ app.post("/render", async (req, res) => {
       });
     }
 
-    // ── 9. Final render: scale + audio replace (drawtext DISABLED) ─────────
-
-    const finalVideoFilter = [
-      `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
-      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
-      `setsar=1`,
-    ].join(",");
+    // ── 9. Final step: mux audio onto video (NO video re-encode) ───────────
+    //
+    // THIS IS THE KEY CHANGE.  v5 used:
+    //   -vf "scale=...,pad=...,setsar=1"  ← forces decode + encode
+    //   -c:v libx264 -preset veryfast     ← spawns full x264 encoder
+    //
+    // v6 uses:
+    //   -c:v copy                         ← zero video processing
+    //
+    // The video is already 720×1280 H.264 yuv420p 30fps from clip extraction.
+    // The concat just glued the packets together.  There is nothing left to
+    // do to the video — we only need to lay the audio track alongside it.
+    //
+    // With -c:v copy, FFmpeg does not instantiate a video decoder or encoder.
+    // It reads compressed H.264 packets from concatenated.mp4 and writes them
+    // straight to the output.  Only the AAC audio encoder runs.
+    //
+    // Peak memory for this step: ~20 MB instead of ~200 MB.
+    //
+    // NOTE: -movflags +faststart is kept.  It does a second pass to move the
+    // moov atom, but on an 8-second file at CRF 28 this is only a few MB of
+    // I/O — not a memory concern.
 
     const actualFinalDuration = +(clipCount * clipDuration).toFixed(2);
     const outputFilename = `reel_${jobId}.mp4`;
@@ -300,29 +329,24 @@ app.post("/render", async (req, res) => {
     // ======================================================================
     // KEY LOG: FFmpeg started (final render)
     // ======================================================================
-    console.log(`[${jobId}] FFmpeg started: final render`);
+    console.log(`[${jobId}] FFmpeg started: final render (video copy, audio encode only)`);
     console.log(`[${jobId}]   duration: ${actualFinalDuration}s`);
     console.log(`[${jobId}]   output: ${outputPath}`);
 
     const finalResult = await runFFmpeg([
       "-hide_banner",
       "-loglevel", "error",
-      "-i", concatenatedPath,
+      "-i", concatenatedPath,           // video source (already encoded)
       "-stream_loop", "-1",
-      "-i", audioPath,
-      "-t", String(actualFinalDuration),
-      "-vf", finalVideoFilter,
-      "-map", "0:v:0",
-      "-map", "1:a:0",
-      "-c:v", "libx264",
-      "-preset", "fast",
-      "-crf", "20",
-      "-c:a", "aac",
-      "-b:a", "192k",
+      "-i", audioPath,                   // audio source (loop if short)
+      "-t", String(actualFinalDuration), // trim to 8 seconds
+      "-map", "0:v:0",                  // video from concatenated file
+      "-map", "1:a:0",                  // audio from audio file
+      "-c:v", "copy",                   // NO video re-encode — pass through
+      "-c:a", "aac",                    // encode audio only
+      "-b:a", "96k",
       "-ar", "44100",
       "-ac", "2",
-      "-r", "30",
-      "-pix_fmt", "yuv420p",
       "-movflags", "+faststart",
       "-y",
       outputPath,
@@ -330,7 +354,6 @@ app.post("/render", async (req, res) => {
 
     // ======================================================================
     // KEY LOG: FFmpeg finished/failed + output check
-    // These three lines are the ones to search for in Railway logs.
     // ======================================================================
     console.log(
       `[${jobId}] FFmpeg exited with code: ${finalResult.code} signal: ${finalResult.signal}`
@@ -456,7 +479,6 @@ async function downloadFile(url, destPath) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: get video duration via ffprobe
 // ─────────────────────────────────────────────────────────────────────────────
-// Uses spawn with an args array — no shell involved.
 
 function getVideoDuration(filePath) {
   return new Promise((resolve, reject) => {
@@ -510,17 +532,8 @@ function getVideoDuration(filePath) {
 // Helper: run FFmpeg via spawn — quiet mode
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// spawn() passes the args array directly to the ffmpeg binary via execvp().
-// No shell is involved — parentheses, quotes, and special characters in
-// filter expressions are passed as-is.
-//
-// The caller is responsible for including -hide_banner and -loglevel error
-// in the args array.  This function buffers stderr silently and returns a
-// result object instead of throwing, so the caller can inspect the exit
-// code, signal, and stderr before deciding how to respond.
-//
-// Return value:
-//   { code: number|null, signal: string|null, stderr: string }
+// spawn() passes args directly to ffmpeg via execvp(). No shell involved.
+// Returns { code, signal, stderr } — always resolves, never rejects.
 
 function runFFmpeg(args) {
   return new Promise((resolve) => {
@@ -530,11 +543,7 @@ function runFFmpeg(args) {
 
     let stderr = "";
 
-    // stdout is unused by ffmpeg when writing to a file, but drain it
     proc.stdout.on("data", () => {});
-
-    // Buffer stderr — with -loglevel error this will only contain actual
-    // error messages, not the hundreds of progress/info lines from before.
     proc.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
@@ -545,14 +554,9 @@ function runFFmpeg(args) {
 
     proc.on("close", (code, signal) => {
       clearTimeout(timeout);
-
-      // If stderr has content, log it now — these are real errors.
       if (stderr.trim()) {
         console.log(`[ffmpeg:stderr] ${stderr.trim()}`);
       }
-
-      // Always resolve (never reject) so the caller can inspect the
-      // result and build the appropriate API response.
       resolve({ code, signal, stderr: stderr.trim() });
     });
 
@@ -570,8 +574,9 @@ function runFFmpeg(args) {
 // ─── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, HOST, () => {
-  console.log(`Reel Generator API (v4) listening on ${HOST}:${PORT}`);
+  console.log(`Reel Generator API (v6) listening on ${HOST}:${PORT}`);
   console.log(`  BASE_URL: ${BASE_URL}`);
+  console.log(`  Defaults: 5 clips × 1.6s, 720×1280, final render = video copy`);
   console.log(`  POST ${BASE_URL}/render`);
   console.log(`  GET  ${BASE_URL}/health`);
 });
