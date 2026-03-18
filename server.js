@@ -1,29 +1,30 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// server.js — Instagram Reel Generator API (v6 — eliminate final re-encode)
+// server.js — Instagram Reel Generator API (v8 — public URL fix)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// CHANGES FROM v5 (fix SIGKILL on final render — still OOM at 720×1280):
+// CHANGES FROM v6:
 //
-// ROOT CAUSE: v5 encoded video TWICE.  Each clip was fully scaled and
-// encoded to H.264 during extraction (step 7), then the final render
-// (step 9) decoded ALL clips and re-encoded them again with libx264 just
-// to add audio.  That second libx264 instance processing 8 seconds of
-// 720×1280 video was what Railway killed.
+// 1. DRAWTEXT RE-ENABLED on the final render step.
 //
-// FIX: The final render now uses -c:v copy.  Since every clip is already
-// 720×1280 H.264 yuv420p at 30fps with identical parameters, the concat
-// produces a stream-copyable file.  The final step only muxes the existing
-// video stream with a newly encoded audio track — no video decoder or
-// encoder is instantiated, so peak memory drops from ~200 MB to ~20 MB.
+// 2. Final render now uses -c:v libx264 instead of -c:v copy, because
+//    drawtext modifies pixel data which requires decode → filter → encode.
+//    This is unavoidable — there is no way to burn text onto compressed
+//    video without re-encoding.
 //
-// OTHER CHANGES:
-//   - Clip count: 10 × 0.8s → 5 × 1.6s  (still 8s total, half the
-//     FFmpeg invocations, half the temp files)
-//   - Audio bitrate: 128k → 96k
-//   - Max concurrent jobs: 3 → 1 (Railway free tier has ~512 MB)
+// 3. To keep memory low despite the re-encode, the final render adds:
+//      -threads 1          caps libx264 to 1 worker thread (~60 MB less)
+//      -preset veryfast    1 reference frame, fast ME
+//      -crf 28             low bitrate output
+//    The input is only 8 seconds of 720×1280 — much smaller than the
+//    original source video — so peak memory stays well under 512 MB.
 //
-// Drawtext is still disabled.  Pipeline: download → probe → extract 5
-// clips → concat → mux audio (video copy) → serve.
+// 4. Font detection restored (pickFont helper) with safe fallback.
+//
+// 5. Phrase escaping uses FFmpeg-only rules (colons, backslashes, single
+//    quotes).  No shell escapes needed because spawn() bypasses /bin/sh.
+//
+// Pipeline: download → probe → extract 5 clips (scale+encode) → concat
+// (stream copy) → drawtext + audio replace (re-encode) → serve.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -38,7 +39,12 @@ const { spawn, execFileSync } = require("child_process");
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+// PUBLIC_BASE_URL is the preferred way to set the public URL explicitly.
+// If not set, the URL is derived from request headers at runtime.
+// The old BASE_URL env var is still accepted as a fallback for compatibility.
+const STATIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.BASE_URL || null;
+
 const OUTPUTS_DIR = path.join(__dirname, "outputs");
 const TEMP_ROOT = path.join(__dirname, "tmp");
 const MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024;
@@ -73,6 +79,39 @@ const app = express();
 app.use(express.json());
 app.use("/outputs", express.static(OUTPUTS_DIR));
 
+// Trust Railway's (and Render's) reverse proxy so req.protocol and
+// req.get("host") reflect the real public-facing values, not the
+// container's internal 0.0.0.0:3000.
+app.set("trust proxy", true);
+
+// ─── Resolve the public base URL ─────────────────────────────────────────
+//
+// Priority:
+//   1. PUBLIC_BASE_URL or BASE_URL env var (explicit, always wins)
+//   2. x-forwarded-proto + x-forwarded-host headers (set by Railway/Render)
+//   3. req.protocol + req.get("host") (Express built-in, trust proxy aware)
+//
+// This is called per-request so it works even when the public URL isn't
+// known at startup (e.g. Railway auto-assigned domains).
+
+function getPublicBaseUrl(req) {
+  // 1. Explicit env var — highest priority
+  if (STATIC_BASE_URL) {
+    // Strip trailing slash if someone set "https://foo.com/"
+    return STATIC_BASE_URL.replace(/\/+$/, "");
+  }
+
+  // 2. Forwarded headers from the reverse proxy
+  const fwdProto = req.get("x-forwarded-proto");
+  const fwdHost = req.get("x-forwarded-host");
+  if (fwdProto && fwdHost) {
+    return `${fwdProto}://${fwdHost}`;
+  }
+
+  // 3. Express built-in (trust proxy makes these reflect the real values)
+  return `${req.protocol}://${req.get("host")}`;
+}
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", activeJobs });
 });
@@ -81,9 +120,6 @@ app.get("/health", (_req, res) => {
 
 app.post("/render", async (req, res) => {
   // ── 1. Parse & validate ──────────────────────────────────────────────────
-  //
-  // Defaults changed: 5 clips × 1.6s = 8s total.
-  // The request body can still override these if needed.
 
   const {
     sourceVideoUrl,
@@ -185,9 +221,8 @@ app.post("/render", async (req, res) => {
 
     // ── 7. Extract clips ───────────────────────────────────────────────────
     //
-    // Each clip is FULLY scaled and encoded here — 720×1280, H.264, yuv420p,
-    // 30fps, veryfast, CRF 28.  This means the concat output will be
-    // stream-copyable and the final step does NOT need to re-encode video.
+    // Each clip is fully scaled and encoded to 720×1280 H.264 yuv420p 30fps.
+    // Concat can then stream-copy these identical-parameter clips.
 
     const scaleFilter =
       `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
@@ -253,9 +288,6 @@ app.post("/render", async (req, res) => {
     }
 
     // ── 8. Concatenate ─────────────────────────────────────────────────────
-    //
-    // All clips have identical codec params so concat demuxer + stream copy
-    // works reliably.  No re-encoding happens here.
 
     const concatListPath = path.join(jobDir, "concat_list.txt");
     fs.writeFileSync(
@@ -299,28 +331,50 @@ app.post("/render", async (req, res) => {
       });
     }
 
-    // ── 9. Final step: mux audio onto video (NO video re-encode) ───────────
+    // ── 9. Final render: drawtext + audio replace ──────────────────────────
     //
-    // THIS IS THE KEY CHANGE.  v5 used:
-    //   -vf "scale=...,pad=...,setsar=1"  ← forces decode + encode
-    //   -c:v libx264 -preset veryfast     ← spawns full x264 encoder
+    // This step now re-encodes video because drawtext modifies pixel data.
+    // The input is only 8 seconds of 720×1280 (the concatenated file),
+    // NOT the original source video, so the encoder workload is small.
     //
-    // v6 uses:
-    //   -c:v copy                         ← zero video processing
+    // Memory controls:
+    //   -threads 1    → libx264 uses 1 encoding thread (fewer frame buffers)
+    //   -preset veryfast → 1 reference frame
+    //   -crf 28       → low bitrate output
+
+    // Escape the phrase for FFmpeg's drawtext filter.
+    // Only FFmpeg-level escapes are needed — no shell escapes because
+    // spawn() passes args directly to ffmpeg without invoking /bin/sh.
     //
-    // The video is already 720×1280 H.264 yuv420p 30fps from clip extraction.
-    // The concat just glued the packets together.  There is nothing left to
-    // do to the video — we only need to lay the audio track alongside it.
-    //
-    // With -c:v copy, FFmpeg does not instantiate a video decoder or encoder.
-    // It reads compressed H.264 packets from concatenated.mp4 and writes them
-    // straight to the output.  Only the AAC audio encoder runs.
-    //
-    // Peak memory for this step: ~20 MB instead of ~200 MB.
-    //
-    // NOTE: -movflags +faststart is kept.  It does a second pass to move the
-    // moov atom, but on an 8-second file at CRF 28 this is only a few MB of
-    // I/O — not a memory concern.
+    // FFmpeg drawtext special characters:
+    //   \  → \\       (backslash is escape char in drawtext)
+    //   :  → \:       (colon separates key=value pairs in drawtext)
+    //   '  → '\''     (end single-quoted string, escaped quote, reopen)
+    const escapedPhrase = phrase
+      .replace(/\\/g, "\\\\")
+      .replace(/:/g, "\\:")
+      .replace(/'/g, "'\\''");
+
+    // Find a bold font file, or fall back to ffmpeg's built-in default
+    const fontFile = pickFont();
+    const fontClause = fontFile ? `fontfile='${fontFile}':` : "";
+
+    // Build the -vf filter chain as a single string.
+    // spawn() passes this as one argv element — no shell parsing.
+    const drawtextFilter =
+      `drawtext=` +
+      `${fontClause}` +
+      `text='${escapedPhrase}':` +
+      `fontsize=80:` +
+      `fontcolor=white:` +
+      `borderw=4:` +
+      `bordercolor=black:` +
+      `x=(w-text_w)/2:` +
+      `y=(h-text_h)/2-h*0.05`;
+
+    // No scale/pad needed — video is already 720×1280 from clip extraction.
+    // drawtext is the only video filter.
+    const videoFilter = drawtextFilter;
 
     const actualFinalDuration = +(clipCount * clipDuration).toFixed(2);
     const outputFilename = `reel_${jobId}.mp4`;
@@ -329,21 +383,29 @@ app.post("/render", async (req, res) => {
     // ======================================================================
     // KEY LOG: FFmpeg started (final render)
     // ======================================================================
-    console.log(`[${jobId}] FFmpeg started: final render (video copy, audio encode only)`);
+    console.log(`[${jobId}] FFmpeg started: final render (drawtext + audio)`);
+    console.log(`[${jobId}]   phrase: "${phrase}"`);
+    console.log(`[${jobId}]   font: ${fontFile || "ffmpeg default"}`);
     console.log(`[${jobId}]   duration: ${actualFinalDuration}s`);
     console.log(`[${jobId}]   output: ${outputPath}`);
 
     const finalResult = await runFFmpeg([
       "-hide_banner",
       "-loglevel", "error",
-      "-i", concatenatedPath,           // video source (already encoded)
+      "-i", concatenatedPath,           // video source (720×1280 H.264)
       "-stream_loop", "-1",
       "-i", audioPath,                   // audio source (loop if short)
       "-t", String(actualFinalDuration), // trim to 8 seconds
-      "-map", "0:v:0",                  // video from concatenated file
+      "-vf", videoFilter,               // drawtext overlay
+      "-map", "0:v:0",                  // video from concat
       "-map", "1:a:0",                  // audio from audio file
-      "-c:v", "copy",                   // NO video re-encode — pass through
-      "-c:a", "aac",                    // encode audio only
+      "-c:v", "libx264",               // must re-encode for drawtext
+      "-preset", "veryfast",
+      "-crf", "28",
+      "-threads", "1",                  // cap encoder memory
+      "-r", "30",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
       "-b:a", "96k",
       "-ar", "44100",
       "-ac", "2",
@@ -370,9 +432,6 @@ app.post("/render", async (req, res) => {
     // ── 10. Return result ──────────────────────────────────────────────────
 
     if (!outputExists) {
-      // ==================================================================
-      // KEY LOG: Returning failure — file missing
-      // ==================================================================
       console.log(`[${jobId}] Returning failure: output file missing after ffmpeg`);
 
       return res.status(500).json({
@@ -384,9 +443,6 @@ app.post("/render", async (req, res) => {
     }
 
     if (finalResult.code !== 0) {
-      // ==================================================================
-      // KEY LOG: Returning failure — non-zero exit
-      // ==================================================================
       console.log(
         `[${jobId}] Returning failure: ffmpeg exited ${finalResult.code}`
       );
@@ -400,7 +456,8 @@ app.post("/render", async (req, res) => {
       });
     }
 
-    const finalMp4Url = `${BASE_URL}/outputs/${outputFilename}`;
+    const publicBase = getPublicBaseUrl(req);
+    const finalMp4Url = `${publicBase}/outputs/${outputFilename}`;
 
     // ======================================================================
     // KEY LOG: Returning success
@@ -571,12 +628,44 @@ function runFFmpeg(args) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: pick a bold font file
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Tries common system font paths.  Returns the first one found, or null
+// to let ffmpeg fall back to its built-in default.
+
+function pickFont() {
+  const candidates = [
+    // Ubuntu / Debian (Railway's Docker images)
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/usr/share/fonts/truetype/ubuntu/Ubuntu-Bold.ttf",
+    // Alpine
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    // RHEL / CentOS / Fedora
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+    // macOS
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/Library/Fonts/Arial Bold.ttf",
+  ];
+
+  for (const fp of candidates) {
+    if (fs.existsSync(fp)) {
+      return fp;
+    }
+  }
+
+  return null;
+}
+
 // ─── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, HOST, () => {
-  console.log(`Reel Generator API (v6) listening on ${HOST}:${PORT}`);
-  console.log(`  BASE_URL: ${BASE_URL}`);
-  console.log(`  Defaults: 5 clips × 1.6s, 720×1280, final render = video copy`);
-  console.log(`  POST ${BASE_URL}/render`);
-  console.log(`  GET  ${BASE_URL}/health`);
+  console.log(`Reel Generator API (v8) listening on ${HOST}:${PORT}`);
+  console.log(`  PUBLIC_BASE_URL: ${STATIC_BASE_URL || "(not set — will derive from request headers)"}`);
+  console.log(`  Defaults: 5 clips × 1.6s, 720×1280, drawtext ENABLED`);
+  console.log(`  POST /render`);
+  console.log(`  GET  /health`);
 });
