@@ -1,0 +1,27 @@
+{
+  "name": "instagram-reel-generator",
+  "version": "1.0.0",
+  "description": "Automated Instagram Reel generator API — accepts a source video + audio, extracts random clips, concatenates, overlays text, and returns a public MP4 URL.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.1",
+    "axios": "^1.7.9",
+    "uuid": "^11.0.3",
+    "fluent-ffmpeg": "^2.1.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "instagram",
+    "reels",
+    "video",
+    "ffmpeg",
+    "automation"
+  ],
+  "license": "MIT"
+}
