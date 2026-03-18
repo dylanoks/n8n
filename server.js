@@ -365,12 +365,12 @@ app.post("/render", async (req, res) => {
       `drawtext=` +
       `${fontClause}` +
       `text='${escapedPhrase}':` +
-      `fontsize=80:` +
+      `fontsize=55:` +
       `fontcolor=white:` +
       `borderw=4:` +
       `bordercolor=black:` +
       `x=(w-text_w)/2:` +
-      `y=(h-text_h)/2-h*0.05`;
+      `y=h*0.12`;
 
     // No scale/pad needed — video is already 720×1280 from clip extraction.
     // drawtext is the only video filter.
