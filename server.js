@@ -355,20 +355,18 @@ app.post("/render", async (req, res) => {
       .replace(/:/g, "\\:")
       .replace(/'/g, "'\\''");
 
-    // Find a bold font file, or fall back to ffmpeg's built-in default
-    const fontFile = pickFont();
-    const fontClause = fontFile ? `fontfile='${fontFile}':` : "";
-
     // Build the -vf filter chain as a single string.
     // spawn() passes this as one argv element — no shell parsing.
+    // Font is hardcoded to DejaVu Sans Bold (installed in the Dockerfile).
     const drawtextFilter =
       `drawtext=` +
-      `${fontClause}` +
+      `fontfile='/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf':` +
       `text='${escapedPhrase}':` +
-      `fontsize=55:` +
+      `fontsize=80:` +
       `fontcolor=white:` +
-      `borderw=4:` +
+      `borderw=8:` +
       `bordercolor=black:` +
+      `line_spacing=10:` +
       `x=(w-text_w)/2:` +
       `y=h*0.12`;
 
