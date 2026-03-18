@@ -1,29 +1,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// server.js — Instagram Reel Generator API (v3 — debug build)
+// server.js — Instagram Reel Generator API (v4 — quiet FFmpeg, clean logs)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// CHANGES FROM v2:
+// CHANGES FROM v3:
 //
-// 1. SIMPLIFIED PIPELINE — drawtext overlay is disabled. The render now does
-//    only: download → probe → extract clips → concat → scale + audio replace.
-//    This isolates whether the failure is in the core FFmpeg pipeline or in
-//    the text overlay filter. Re-enable drawtext once this version works.
+// 1. FFmpeg runs with -hide_banner -loglevel error so it only emits output
+//    when something actually goes wrong.  No more codec tables, encoding
+//    speed lines, or frame counters flooding Railway logs.
 //
-// 2. FULL STDERR IN LOGS — FFmpeg's stderr is streamed line-by-line to
-//    console.error() in real time so it appears in Railway's log viewer
-//    as it happens, not buffered until the process exits.
+// 2. runFFmpeg no longer streams stderr line-by-line to console during
+//    execution.  It buffers stderr silently, then:
+//      • On success → logs one line: "FFmpeg exited with code: 0 signal: null"
+//      • On failure → logs that same line PLUS the full stderr buffer.
+//    Because loglevel is "error", the buffer will only contain actual errors.
 //
-// 3. FULL STDERR IN API RESPONSE — on failure the entire stderr string is
-//    returned in the JSON body so n8n can display the complete error.
+// 3. After every FFmpeg call the route handler logs exactly:
+//      FFmpeg exited with code: <code> signal: <signal>
+//      Output exists: true/false
+//      Output size: <bytes>
+//    So you can ctrl-F these three lines in Railway to see the outcome.
 //
-// 4. STRUCTURED ERROR RESPONSE — failures return:
-//    { success: false, error: "...", exitCode: N, signal: "SIGKILL"|null }
-//
-// 5. STEP LOGGING — every phase logs start/finish with timestamps so you
-//    can see exactly where the pipeline stalls or dies in Railway logs.
-//
-// 6. FFPROBE VIA SPAWN — getVideoDuration now uses spawn instead of
-//    execFileSync, with full stderr capture on failure.
+// 4. Drawtext is still disabled.  Pipeline: download → probe → extract →
+//    concat → scale + audio replace → serve.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -48,16 +46,16 @@ let activeJobs = 0;
 fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
 fs.mkdirSync(TEMP_ROOT, { recursive: true });
 
-// ─── Verify ffmpeg / ffprobe are available ───────────────────────────────────
+// ─── Verify ffmpeg / ffprobe ─────────────────────────────────────────────────
 
 function checkDependencies() {
   try {
     execFileSync("ffmpeg", ["-version"], { stdio: "ignore" });
     execFileSync("ffprobe", ["-version"], { stdio: "ignore" });
-    console.log("[startup] ✓ ffmpeg and ffprobe found");
+    console.log("[startup] ffmpeg and ffprobe found");
   } catch {
     console.error(
-      "[startup] ✗ ffmpeg or ffprobe not found.\n" +
+      "[startup] ffmpeg or ffprobe not found.\n" +
         "  Ubuntu/Debian: sudo apt-get install ffmpeg\n" +
         "  macOS:         brew install ffmpeg"
     );
@@ -67,7 +65,7 @@ function checkDependencies() {
 
 checkDependencies();
 
-// ─── Express app ─────────────────────────────────────────────────────────────
+// ─── Express ─────────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
@@ -80,9 +78,7 @@ app.get("/health", (_req, res) => {
 // ─── POST /render ────────────────────────────────────────────────────────────
 
 app.post("/render", async (req, res) => {
-  const startTime = Date.now();
-
-  // ── 1. Validate ──────────────────────────────────────────────────────────
+  // ── 1. Parse & validate ──────────────────────────────────────────────────
 
   const {
     sourceVideoUrl,
@@ -95,20 +91,10 @@ app.post("/render", async (req, res) => {
     height = 1920,
   } = req.body;
 
-  console.log("\n══════════════════════════════════════════════════════════");
-  console.log(`[render] REQUEST RECEIVED at ${new Date().toISOString()}`);
-  console.log(`[render]   sourceVideoUrl: ${sourceVideoUrl}`);
-  console.log(`[render]   audioUrl:       ${audioUrl}`);
-  console.log(`[render]   phrase:         "${phrase}"`);
-  console.log(`[render]   clipCount:      ${clipCount}`);
-  console.log(`[render]   clipDuration:   ${clipDuration}s`);
-  console.log(`[render]   resolution:     ${width}x${height}`);
-  console.log("══════════════════════════════════════════════════════════");
-
   if (!sourceVideoUrl || !audioUrl) {
     return res.status(400).json({
       success: false,
-      error: "Missing required fields: sourceVideoUrl and audioUrl are required.",
+      error: "Missing required fields: sourceVideoUrl and audioUrl.",
       exitCode: null,
       signal: null,
     });
@@ -126,10 +112,9 @@ app.post("/render", async (req, res) => {
   // ── 2. Concurrency guard ─────────────────────────────────────────────────
 
   if (activeJobs >= MAX_CONCURRENT_JOBS) {
-    console.warn(`[render] REJECTED — ${activeJobs} jobs already running`);
     return res.status(503).json({
       success: false,
-      error: `Server busy — ${activeJobs} jobs running. Try again shortly.`,
+      error: `Server busy — ${activeJobs} jobs running.`,
       exitCode: null,
       signal: null,
     });
@@ -137,75 +122,69 @@ app.post("/render", async (req, res) => {
 
   activeJobs++;
 
-  // ── 3. Job directory ─────────────────────────────────────────────────────
-
   const jobId = uuidv4();
   const jobDir = path.join(TEMP_ROOT, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
-  console.log(`[${jobId}] Job directory created: ${jobDir}`);
+  // ========================================================================
+  // KEY LOG: Render request started
+  // ========================================================================
+  console.log(`[${jobId}] Render request started`);
+  console.log(`[${jobId}]   sourceVideoUrl: ${sourceVideoUrl}`);
+  console.log(`[${jobId}]   audioUrl: ${audioUrl}`);
+  console.log(`[${jobId}]   phrase: "${phrase}"`);
 
   try {
-    // ── 4. Download source video ───────────────────────────────────────────
+    // ── 3. Download source video ───────────────────────────────────────────
 
     const sourceVideoPath = path.join(jobDir, "source_video.mp4");
-    console.log(`[${jobId}] STEP 1/6 — Downloading source video …`);
-    console.log(`[${jobId}]   URL: ${sourceVideoUrl}`);
-    const dlVideoStart = Date.now();
     await downloadFile(sourceVideoUrl, sourceVideoPath);
-    const videoSize = fs.statSync(sourceVideoPath).size;
-    console.log(
-      `[${jobId}]   ✓ Downloaded ${(videoSize / 1024 / 1024).toFixed(1)} MB ` +
-        `in ${((Date.now() - dlVideoStart) / 1000).toFixed(1)}s`
-    );
+    const videoBytes = fs.statSync(sourceVideoPath).size;
 
-    // ── 5. Download audio ──────────────────────────────────────────────────
+    // ======================================================================
+    // KEY LOG: Source video downloaded
+    // ======================================================================
+    console.log(`[${jobId}] Source video downloaded (${videoBytes} bytes)`);
+
+    // ── 4. Download audio ──────────────────────────────────────────────────
 
     const audioPath = path.join(jobDir, "audio_input.mp3");
-    console.log(`[${jobId}] STEP 2/6 — Downloading audio …`);
-    console.log(`[${jobId}]   URL: ${audioUrl}`);
-    const dlAudioStart = Date.now();
     await downloadFile(audioUrl, audioPath);
-    const audioSize = fs.statSync(audioPath).size;
-    console.log(
-      `[${jobId}]   ✓ Downloaded ${(audioSize / 1024 / 1024).toFixed(1)} MB ` +
-        `in ${((Date.now() - dlAudioStart) / 1000).toFixed(1)}s`
-    );
+    const audioBytes = fs.statSync(audioPath).size;
 
-    // ── 6. Probe video duration ────────────────────────────────────────────
+    // ======================================================================
+    // KEY LOG: Audio downloaded
+    // ======================================================================
+    console.log(`[${jobId}] Audio downloaded (${audioBytes} bytes)`);
 
-    console.log(`[${jobId}] STEP 3/6 — Probing video duration with ffprobe …`);
-    const videoDuration = await getVideoDuration(sourceVideoPath, jobId);
-    console.log(`[${jobId}]   ✓ Source duration: ${videoDuration}s`);
+    // ── 5. Probe duration ──────────────────────────────────────────────────
+
+    const videoDuration = await getVideoDuration(sourceVideoPath);
+    console.log(`[${jobId}] Video duration: ${videoDuration}s`);
 
     if (videoDuration < clipDuration) {
       throw new Error(
-        `Source video too short (${videoDuration}s). Need ≥ ${clipDuration}s.`
+        `Source video too short (${videoDuration}s). Need >= ${clipDuration}s.`
       );
     }
 
-    // ── 7. Random start times ──────────────────────────────────────────────
+    // ── 6. Random start times ──────────────────────────────────────────────
 
     const maxStart = videoDuration - clipDuration;
     const startTimes = [];
     for (let i = 0; i < clipCount; i++) {
       startTimes.push(+(Math.random() * maxStart).toFixed(3));
     }
-    console.log(`[${jobId}]   Start times: [${startTimes.join(", ")}]`);
 
-    // ── 8. Extract clips ───────────────────────────────────────────────────
+    // ── 7. Extract clips ───────────────────────────────────────────────────
 
-    // Video filter: scale to target with letterboxing.
-    // Parentheses in (ow-iw)/2 are safe because spawn() does not use a shell.
     const scaleFilter =
       `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
       `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,` +
       `setsar=1`;
 
-    console.log(`[${jobId}] STEP 4/6 — Extracting ${clipCount} clips …`);
-    console.log(`[${jobId}]   Filter: ${scaleFilter}`);
-
     const clipPaths = [];
+
     for (let i = 0; i < clipCount; i++) {
       const clipPath = path.join(
         jobDir,
@@ -213,7 +192,16 @@ app.post("/render", async (req, res) => {
       );
       clipPaths.push(clipPath);
 
-      const clipArgs = [
+      // ==================================================================
+      // KEY LOG: FFmpeg started (clip extraction)
+      // ==================================================================
+      console.log(
+        `[${jobId}] FFmpeg started: clip ${i + 1}/${clipCount} at ${startTimes[i]}s`
+      );
+
+      const result = await runFFmpeg([
+        "-hide_banner",
+        "-loglevel", "error",
         "-ss", String(startTimes[i]),
         "-i", sourceVideoPath,
         "-t", String(clipDuration),
@@ -226,55 +214,79 @@ app.post("/render", async (req, res) => {
         "-pix_fmt", "yuv420p",
         "-y",
         clipPath,
-      ];
+      ]);
 
-      console.log(`[${jobId}]   Clip ${i + 1}/${clipCount} — seek ${startTimes[i]}s`);
-      await runFFmpeg(clipArgs, jobId, `clip-${i + 1}`);
+      // ==================================================================
+      // KEY LOG: FFmpeg exited (clip)
+      // ==================================================================
+      console.log(
+        `[${jobId}] FFmpeg exited with code: ${result.code} signal: ${result.signal}`
+      );
 
-      // Verify the clip was actually written
-      if (!fs.existsSync(clipPath)) {
-        throw new Error(`Clip file was not created: ${clipPath}`);
+      const clipExists = fs.existsSync(clipPath);
+      console.log(`[${jobId}] Output exists: ${clipExists}`);
+
+      if (clipExists) {
+        const clipSize = fs.statSync(clipPath).size;
+        console.log(`[${jobId}] Output size: ${clipSize}`);
       }
-      const clipSize = fs.statSync(clipPath).size;
-      console.log(`[${jobId}]     → ${(clipSize / 1024).toFixed(0)} KB`);
-    }
-    console.log(`[${jobId}]   ✓ All ${clipCount} clips extracted`);
 
-    // ── 9. Concat list ─────────────────────────────────────────────────────
+      if (!clipExists || result.code !== 0) {
+        return res.status(500).json({
+          success: false,
+          error: result.stderr || `Clip ${i + 1} extraction failed`,
+          exitCode: result.code,
+          signal: result.signal,
+        });
+      }
+    }
+
+    // ── 8. Concatenate ─────────────────────────────────────────────────────
 
     const concatListPath = path.join(jobDir, "concat_list.txt");
-    const concatListContent = clipPaths.map((p) => `file '${p}'`).join("\n");
-    fs.writeFileSync(concatListPath, concatListContent);
-    console.log(`[${jobId}] STEP 5/6 — Concatenating clips …`);
-    console.log(`[${jobId}]   Concat list:\n${concatListContent}`);
+    fs.writeFileSync(
+      concatListPath,
+      clipPaths.map((p) => `file '${p}'`).join("\n")
+    );
 
     const concatenatedPath = path.join(jobDir, "concatenated.mp4");
-    await runFFmpeg(
-      [
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concatListPath,
-        "-c", "copy",
-        "-y",
-        concatenatedPath,
-      ],
-      jobId,
-      "concat"
-    );
 
-    if (!fs.existsSync(concatenatedPath)) {
-      throw new Error(`Concatenated file was not created: ${concatenatedPath}`);
-    }
-    const concatSize = fs.statSync(concatenatedPath).size;
+    console.log(`[${jobId}] FFmpeg started: concatenation`);
+
+    const concatResult = await runFFmpeg([
+      "-hide_banner",
+      "-loglevel", "error",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatListPath,
+      "-c", "copy",
+      "-y",
+      concatenatedPath,
+    ]);
+
     console.log(
-      `[${jobId}]   ✓ Concatenated: ${(concatSize / 1024 / 1024).toFixed(1)} MB`
+      `[${jobId}] FFmpeg exited with code: ${concatResult.code} signal: ${concatResult.signal}`
     );
 
-    // ── 10. Final render: scale + audio replace (NO drawtext) ──────────────
+    const concatExists = fs.existsSync(concatenatedPath);
+    console.log(`[${jobId}] Output exists: ${concatExists}`);
 
-    // DRAWTEXT IS DISABLED for debugging.
-    // The video filter only does scale + pad + setsar.
-    // Once this pipeline succeeds end-to-end, re-enable drawtext.
+    if (concatExists) {
+      const concatSize = fs.statSync(concatenatedPath).size;
+      console.log(`[${jobId}] Output size: ${concatSize}`);
+    }
+
+    if (!concatExists || concatResult.code !== 0) {
+      return res.status(500).json({
+        success: false,
+        error: concatResult.stderr || "Concatenation failed",
+        exitCode: concatResult.code,
+        signal: concatResult.signal,
+      });
+    }
+
+    // ── 9. Final render: scale + audio replace (drawtext DISABLED) ─────────
+
     const finalVideoFilter = [
       `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
       `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
@@ -285,12 +297,16 @@ app.post("/render", async (req, res) => {
     const outputFilename = `reel_${jobId}.mp4`;
     const outputPath = path.join(OUTPUTS_DIR, outputFilename);
 
-    console.log(`[${jobId}] STEP 6/6 — Final render (drawtext DISABLED) …`);
-    console.log(`[${jobId}]   Video filter: ${finalVideoFilter}`);
-    console.log(`[${jobId}]   Duration:     ${actualFinalDuration}s`);
-    console.log(`[${jobId}]   Output:       ${outputPath}`);
+    // ======================================================================
+    // KEY LOG: FFmpeg started (final render)
+    // ======================================================================
+    console.log(`[${jobId}] FFmpeg started: final render`);
+    console.log(`[${jobId}]   duration: ${actualFinalDuration}s`);
+    console.log(`[${jobId}]   output: ${outputPath}`);
 
-    const finalArgs = [
+    const finalResult = await runFFmpeg([
+      "-hide_banner",
+      "-loglevel", "error",
       "-i", concatenatedPath,
       "-stream_loop", "-1",
       "-i", audioPath,
@@ -310,81 +326,96 @@ app.post("/render", async (req, res) => {
       "-movflags", "+faststart",
       "-y",
       outputPath,
-    ];
+    ]);
 
-    await runFFmpeg(finalArgs, jobId, "final-render");
+    // ======================================================================
+    // KEY LOG: FFmpeg finished/failed + output check
+    // These three lines are the ones to search for in Railway logs.
+    // ======================================================================
+    console.log(
+      `[${jobId}] FFmpeg exited with code: ${finalResult.code} signal: ${finalResult.signal}`
+    );
 
-    // Verify output
-    if (!fs.existsSync(outputPath)) {
-      throw new Error(`Output file was not created: ${outputPath}`);
+    const outputExists = fs.existsSync(outputPath);
+    console.log(`[${jobId}] Output exists: ${outputExists}`);
+
+    if (outputExists) {
+      const outputSize = fs.statSync(outputPath).size;
+      console.log(`[${jobId}] Output size: ${outputSize}`);
     }
-    const outputSize = fs.statSync(outputPath).size;
-    if (outputSize < 1024) {
-      throw new Error(
-        `Output file suspiciously small (${outputSize} bytes). Likely corrupt.`
+
+    // ── 10. Return result ──────────────────────────────────────────────────
+
+    if (!outputExists) {
+      // ==================================================================
+      // KEY LOG: Returning failure — file missing
+      // ==================================================================
+      console.log(`[${jobId}] Returning failure: output file missing after ffmpeg`);
+
+      return res.status(500).json({
+        success: false,
+        error: "Output file missing after ffmpeg",
+        exitCode: finalResult.code,
+        signal: finalResult.signal,
+      });
+    }
+
+    if (finalResult.code !== 0) {
+      // ==================================================================
+      // KEY LOG: Returning failure — non-zero exit
+      // ==================================================================
+      console.log(
+        `[${jobId}] Returning failure: ffmpeg exited ${finalResult.code}`
       );
-    }
+      console.log(`[${jobId}] stderr: ${finalResult.stderr}`);
 
-    // ── 11. Done ───────────────────────────────────────────────────────────
+      return res.status(500).json({
+        success: false,
+        error: finalResult.stderr || `FFmpeg exited with code ${finalResult.code}`,
+        exitCode: finalResult.code,
+        signal: finalResult.signal,
+      });
+    }
 
     const finalMp4Url = `${BASE_URL}/outputs/${outputFilename}`;
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    console.log(`[${jobId}] ══════════════════════════════════════════════`);
-    console.log(`[${jobId}] ✅ SUCCESS in ${elapsed}s`);
-    console.log(`[${jobId}]   Size: ${(outputSize / 1024 / 1024).toFixed(1)} MB`);
-    console.log(`[${jobId}]   URL:  ${finalMp4Url}`);
-    console.log(`[${jobId}] ══════════════════════════════════════════════\n`);
+    // ======================================================================
+    // KEY LOG: Returning success
+    // ======================================================================
+    console.log(`[${jobId}] Returning success: ${finalMp4Url}`);
 
     return res.json({
       success: true,
       jobId,
       finalMp4Url,
-      meta: {
-        clips: clipCount,
-        clipDuration,
-        totalDuration: actualFinalDuration,
-        resolution: `${width}x${height}`,
-        phrase,
-        drawtextEnabled: false,
-        elapsedSeconds: parseFloat(elapsed),
-        outputSizeMB: +(outputSize / 1024 / 1024).toFixed(1),
-      },
     });
   } catch (err) {
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-
-    console.error(`[${jobId}] ══════════════════════════════════════════════`);
-    console.error(`[${jobId}] ✗ FAILED after ${elapsed}s`);
-    console.error(`[${jobId}]   Error: ${err.message}`);
-    if (err.ffmpegStderr) {
-      console.error(`[${jobId}]   FFmpeg stderr (${err.ffmpegStderr.length} chars):`);
-      console.error(err.ffmpegStderr);
+    // ======================================================================
+    // KEY LOG: Returning failure — exception
+    // ======================================================================
+    console.log(`[${jobId}] Returning failure: ${err.message}`);
+    if (err.stderr) {
+      console.log(`[${jobId}] stderr: ${err.stderr}`);
     }
-    console.error(`[${jobId}] ══════════════════════════════════════════════\n`);
 
     return res.status(500).json({
       success: false,
-      jobId,
-      error: err.ffmpegStderr || err.message,
-      exitCode: err.ffmpegExitCode ?? null,
-      signal: err.ffmpegSignal ?? null,
+      error: err.message,
+      exitCode: null,
+      signal: null,
     });
   } finally {
     activeJobs--;
     try {
       fs.rmSync(jobDir, { recursive: true, force: true });
-      console.log(`[${jobId}] 🧹 Temp directory cleaned up`);
-    } catch (cleanupErr) {
-      console.warn(
-        `[${jobId}] ⚠ Cleanup failed: ${cleanupErr.message}`
-      );
+    } catch (_) {
+      // cleanup is best-effort
     }
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: download a remote file to disk
+// Helper: download a remote file
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function downloadFile(url, destPath) {
@@ -395,7 +426,6 @@ async function downloadFile(url, destPath) {
     timeout: 120_000,
     maxContentLength: MAX_DOWNLOAD_BYTES,
     maxBodyLength: MAX_DOWNLOAD_BYTES,
-    // Follow redirects (some CDNs / signed URLs redirect)
     maxRedirects: 5,
   });
 
@@ -424,22 +454,19 @@ async function downloadFile(url, destPath) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: get video duration via ffprobe (spawn, not execFileSync)
+// Helper: get video duration via ffprobe
 // ─────────────────────────────────────────────────────────────────────────────
-// Uses spawn so we can capture full stderr if ffprobe fails.
+// Uses spawn with an args array — no shell involved.
 
-function getVideoDuration(filePath, jobId) {
+function getVideoDuration(filePath) {
   return new Promise((resolve, reject) => {
-    const args = [
-      "-v", "error",
+    const proc = spawn("ffprobe", [
+      "-hide_banner",
+      "-loglevel", "error",
       "-show_entries", "format=duration",
       "-of", "default=noprint_wrappers=1:nokey=1",
       filePath,
-    ];
-
-    console.log(`[${jobId}]   ffprobe args: ${JSON.stringify(args)}`);
-
-    const proc = spawn("ffprobe", args, {
+    ], {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -449,39 +476,24 @@ function getVideoDuration(filePath, jobId) {
     proc.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
-
     proc.stderr.on("data", (chunk) => {
-      const text = chunk.toString();
-      stderr += text;
-      // Stream to console in real time
-      text.split("\n").filter(Boolean).forEach((line) => {
-        console.error(`[${jobId}]   [ffprobe:err] ${line}`);
-      });
+      stderr += chunk.toString();
     });
 
     const timeout = setTimeout(() => {
       proc.kill("SIGKILL");
-      reject(new Error("ffprobe timed out after 30s."));
+      reject(new Error("ffprobe timed out after 30s"));
     }, 30_000);
 
     proc.on("close", (code) => {
       clearTimeout(timeout);
-
       if (code !== 0) {
-        const err = new Error(
-          `ffprobe exited with code ${code}.\nstderr: ${stderr}`
-        );
-        reject(err);
+        reject(new Error(`ffprobe exited ${code}: ${stderr}`));
         return;
       }
-
       const duration = parseFloat(stdout.trim());
       if (isNaN(duration) || duration <= 0) {
-        reject(
-          new Error(
-            `ffprobe returned invalid duration: "${stdout.trim()}"\nstderr: ${stderr}`
-          )
-        );
+        reject(new Error(`ffprobe invalid duration: "${stdout.trim()}"`));
       } else {
         resolve(duration);
       }
@@ -489,118 +501,68 @@ function getVideoDuration(filePath, jobId) {
 
     proc.on("error", (err) => {
       clearTimeout(timeout);
-      reject(new Error(`Failed to start ffprobe: ${err.message}`));
+      reject(new Error(`ffprobe spawn error: ${err.message}`));
     });
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: run FFmpeg via spawn with full diagnostic logging
+// Helper: run FFmpeg via spawn — quiet mode
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Key differences from v2:
+// spawn() passes the args array directly to the ffmpeg binary via execvp().
+// No shell is involved — parentheses, quotes, and special characters in
+// filter expressions are passed as-is.
 //
-// 1. Both stdout AND stderr are streamed line-by-line to console in real time
-//    so they appear in Railway's log viewer as they happen.
+// The caller is responsible for including -hide_banner and -loglevel error
+// in the args array.  This function buffers stderr silently and returns a
+// result object instead of throwing, so the caller can inspect the exit
+// code, signal, and stderr before deciding how to respond.
 //
-// 2. The FULL stderr buffer (not just the last 8 lines) is attached to the
-//    error object so the API can return it to n8n.
-//
-// 3. The error object carries .ffmpegExitCode and .ffmpegSignal so the API
-//    response can include structured diagnostics.
-//
-// 4. The args array is logged as JSON before the call so you can copy-paste
-//    it for local reproduction.
-//
-// spawn() is used — no shell is involved. Each array element is passed as a
-// raw argv entry to the ffmpeg binary via execvp(). Parentheses, quotes,
-// spaces, etc. are all inert.
+// Return value:
+//   { code: number|null, signal: string|null, stderr: string }
 
-function runFFmpeg(args, jobId, label) {
-  return new Promise((resolve, reject) => {
-    console.log(`[${jobId}]   [${label}] Starting ffmpeg`);
-    console.log(`[${jobId}]   [${label}] Args (${args.length} elements):`);
-    console.log(`[${jobId}]   [${label}] ${JSON.stringify(args)}`);
-
-    const ffmpegStart = Date.now();
-
+function runFFmpeg(args) {
+  return new Promise((resolve) => {
     const proc = spawn("ffmpeg", args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    let stdout = "";
     let stderr = "";
 
-    // Stream stdout to console line by line
-    proc.stdout.on("data", (chunk) => {
-      const text = chunk.toString();
-      stdout += text;
-      text.split("\n").filter(Boolean).forEach((line) => {
-        console.log(`[${jobId}]   [${label}:out] ${line}`);
-      });
-    });
+    // stdout is unused by ffmpeg when writing to a file, but drain it
+    proc.stdout.on("data", () => {});
 
-    // Stream stderr to console line by line
-    // FFmpeg sends all progress/diagnostic output to stderr, including
-    // non-error info like encoding speed. This is expected and useful.
+    // Buffer stderr — with -loglevel error this will only contain actual
+    // error messages, not the hundreds of progress/info lines from before.
     proc.stderr.on("data", (chunk) => {
-      const text = chunk.toString();
-      stderr += text;
-      text.split("\n").filter(Boolean).forEach((line) => {
-        console.error(`[${jobId}]   [${label}:err] ${line}`);
-      });
+      stderr += chunk.toString();
     });
 
-    // Hard timeout: 10 minutes
     const timeout = setTimeout(() => {
-      console.error(`[${jobId}]   [${label}] ✗ TIMEOUT after 10 minutes — killing`);
       proc.kill("SIGKILL");
     }, 600_000);
 
     proc.on("close", (code, signal) => {
       clearTimeout(timeout);
-      const elapsed = ((Date.now() - ffmpegStart) / 1000).toFixed(1);
 
-      if (code === 0) {
-        console.log(
-          `[${jobId}]   [${label}] ✓ Finished in ${elapsed}s (exit 0)`
-        );
-        resolve({ stdout, stderr });
-      } else {
-        console.error(
-          `[${jobId}]   [${label}] ✗ FAILED in ${elapsed}s ` +
-            `(exit ${code}, signal ${signal})`
-        );
-        console.error(
-          `[${jobId}]   [${label}] Full stderr (${stderr.length} chars):`
-        );
-        console.error(stderr);
-
-        const err = new Error(
-          `FFmpeg [${label}] exited with code ${code} (signal: ${signal})`
-        );
-        // Attach diagnostic fields so the route handler can include them
-        // in the API response for n8n to display.
-        err.ffmpegStderr = stderr;
-        err.ffmpegExitCode = code;
-        err.ffmpegSignal = signal;
-        reject(err);
+      // If stderr has content, log it now — these are real errors.
+      if (stderr.trim()) {
+        console.log(`[ffmpeg:stderr] ${stderr.trim()}`);
       }
+
+      // Always resolve (never reject) so the caller can inspect the
+      // result and build the appropriate API response.
+      resolve({ code, signal, stderr: stderr.trim() });
     });
 
     proc.on("error", (spawnErr) => {
       clearTimeout(timeout);
-      console.error(
-        `[${jobId}]   [${label}] ✗ spawn() error: ${spawnErr.message}`
-      );
-
-      const err = new Error(
-        `Failed to start ffmpeg [${label}]: ${spawnErr.message}`
-      );
-      err.ffmpegStderr = stderr;
-      err.ffmpegExitCode = null;
-      err.ffmpegSignal = null;
-      reject(err);
+      resolve({
+        code: null,
+        signal: null,
+        stderr: `spawn error: ${spawnErr.message}`,
+      });
     });
   });
 }
@@ -608,13 +570,8 @@ function runFFmpeg(args, jobId, label) {
 // ─── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, HOST, () => {
-  console.log(`\n🚀 Instagram Reel Generator API (v3 — debug build)`);
-  console.log(`   Listening on ${HOST}:${PORT}`);
-  console.log(`   BASE_URL:          ${BASE_URL}`);
-  console.log(`   OUTPUTS_DIR:       ${OUTPUTS_DIR}`);
-  console.log(`   TEMP_ROOT:         ${TEMP_ROOT}`);
-  console.log(`   MAX_CONCURRENT:    ${MAX_CONCURRENT_JOBS}`);
-  console.log(`   Drawtext overlay:  DISABLED (debug mode)`);
-  console.log(`\n   POST ${BASE_URL}/render`);
-  console.log(`   GET  ${BASE_URL}/health\n`);
+  console.log(`Reel Generator API (v4) listening on ${HOST}:${PORT}`);
+  console.log(`  BASE_URL: ${BASE_URL}`);
+  console.log(`  POST ${BASE_URL}/render`);
+  console.log(`  GET  ${BASE_URL}/health`);
 });
