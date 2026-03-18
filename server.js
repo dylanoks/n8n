@@ -130,6 +130,8 @@ app.post("/render", async (req, res) => {
     finalDuration = 8,
     width = 720,
     height = 1280,
+    sceneDetection = true,
+    sceneThreshold = 0.30,
   } = req.body;
 
   if (!sourceVideoUrl || !audioUrl) {
@@ -176,6 +178,7 @@ app.post("/render", async (req, res) => {
   console.log(`[${jobId}]   phrase: "${phrase}"`);
   console.log(`[${jobId}]   clips: ${clipCount} × ${clipDuration}s = ${clipCount * clipDuration}s`);
   console.log(`[${jobId}]   resolution: ${width}×${height}`);
+  console.log(`[${jobId}]   sceneDetection: ${sceneDetection} (threshold ${sceneThreshold})`);
 
   try {
     // ── 3. Download source video ───────────────────────────────────────────
@@ -211,13 +214,37 @@ app.post("/render", async (req, res) => {
       );
     }
 
-    // ── 6. Random start times ──────────────────────────────────────────────
+    // ── 6. Scene-aware start times ─────────────────────────────────────────
+    //
+    // Prefer real scene boundaries detected by FFmpeg. If too few scene cuts
+    // are found, fall back to random timestamps for the remaining clips.
 
     const maxStart = videoDuration - clipDuration;
-    const startTimes = [];
-    for (let i = 0; i < clipCount; i++) {
+    let startTimes = [];
+
+    if (sceneDetection) {
+      const sceneCandidates = await detectSceneCuts(sourceVideoPath, sceneThreshold);
+      console.log(`[${jobId}] Scene candidates detected: ${sceneCandidates.length}`);
+
+      // Keep only scene starts that leave enough room for one full clip.
+      const usableSceneStarts = sceneCandidates
+        .filter((t) => t >= 0 && t <= maxStart)
+        .map((t) => +t.toFixed(3));
+
+      console.log(`[${jobId}] Usable scene starts: ${usableSceneStarts.length}`);
+
+      // Shuffle and take as many as we need.
+      const shuffled = [...usableSceneStarts].sort(() => Math.random() - 0.5);
+      startTimes = shuffled.slice(0, clipCount);
+    }
+
+    // If scene detection found too few cuts, fill the rest randomly.
+    while (startTimes.length < clipCount) {
       startTimes.push(+(Math.random() * maxStart).toFixed(3));
     }
+
+    // Final shuffle so scene-based picks are mixed naturally.
+    startTimes = startTimes.sort(() => Math.random() - 0.5);
 
     // ── 7. Extract clips ───────────────────────────────────────────────────
     //
@@ -493,6 +520,71 @@ app.post("/render", async (req, res) => {
     }
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: detect scene cuts via FFmpeg
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Uses FFmpeg's built-in scene detection (not AI) to find timestamps where
+// a new shot likely begins. Returns an array of pts_time numbers.
+
+function detectSceneCuts(filePath, threshold = 0.30) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-hide_banner",
+      "-loglevel", "info",
+      "-i", filePath,
+      "-filter:v", `select='gt(scene,${threshold})',showinfo`,
+      "-an",
+      "-f", "null",
+      "-",
+    ];
+
+    const proc = spawn("ffmpeg", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stderr = "";
+
+    proc.stdout.on("data", () => {});
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    const timeout = setTimeout(() => {
+      proc.kill("SIGKILL");
+      reject(new Error("scene detection timed out after 120s"));
+    }, 120_000);
+
+    proc.on("close", (code) => {
+      clearTimeout(timeout);
+
+      // FFmpeg scene detection writes showinfo lines to stderr.
+      const matches = [...stderr.matchAll(/pts_time:([0-9.]+)/g)];
+      const times = matches
+        .map((m) => parseFloat(m[1]))
+        .filter((n) => !Number.isNaN(n));
+
+      // ffmpeg may exit 0 or sometimes non-zero for null output edge cases;
+      // if we still extracted timestamps, use them.
+      if (times.length > 0) {
+        resolve(times);
+        return;
+      }
+
+      if (code === 0) {
+        resolve([]);
+      } else {
+        reject(new Error(`scene detection failed with code ${code}: ${stderr}`));
+      }
+    });
+
+    proc.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(new Error(`scene detection spawn error: ${err.message}`));
+    });
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: download a remote file
